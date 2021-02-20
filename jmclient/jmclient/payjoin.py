@@ -25,7 +25,8 @@ import jmbitcoin as btc
 from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet, estimate_tx_fee
 from .wallet_service import WalletService
 from .taker_utils import direct_send
-from jmclient import RegtestBitcoinCoreInterface, select_one_utxo, process_shutdown
+from jmclient import (RegtestBitcoinCoreInterface, select_one_utxo,
+                      process_shutdown, BIP78ClientProtocolFactory)
 
 """
 For some documentation see:
@@ -544,12 +545,6 @@ def send_payjoin(manager, accept_callback=None,
     if not payment_psbt:
         return (False, "could not create non-payjoin payment")
 
-    # TLS whitelist is for regtest testing, it is treated as hostnames for
-    # which tls certificate verification is ignored.
-    tls_whitelist = None
-    if isinstance(jm_single().bc_interface, RegtestBitcoinCoreInterface):
-        tls_whitelist = [b"127.0.0.1"]
-
     manager.set_payment_tx_and_psbt(payment_psbt)
 
     # add delayed call to broadcast this after 1 minute
@@ -559,31 +554,6 @@ def send_payjoin(manager, accept_callback=None,
 
     # Now we send the request to the server, with the encoded
     # payment PSBT
-
-    # First we create a twisted web Agent object:
-
-    # TODO genericize/move out/use library function:
-    def is_hs_uri(s):
-        x = urlparse.urlparse(s)
-        if x.hostname.endswith(".onion"):
-            return (x.scheme, x.hostname, x.port)
-        return False
-
-    tor_url_data = is_hs_uri(manager.server)
-    if tor_url_data:
-        # note the return value is currently unused here
-        socks5_host = jm_single().config.get("PAYJOIN", "onion_socks5_host")
-        socks5_port = int(jm_single().config.get("PAYJOIN", "onion_socks5_port"))
-        # note: SSL not supported at the moment:
-        torEndpoint = TCP4ClientEndpoint(reactor, socks5_host, socks5_port)
-        agent = tor_agent(reactor, torEndpoint)
-    else:
-        if not tls_whitelist:
-            agent = Agent(reactor)
-        else:
-            agent = Agent(reactor,
-                contextFactory=WhitelistContextFactory(tls_whitelist))
-
     body = BytesProducer(payment_psbt.to_base64().encode("utf-8"))
 
     #Set the query parameters for the request:
@@ -611,28 +581,14 @@ def send_payjoin(manager, accept_callback=None,
 
     min_fee_rate = float(jm_single().config.get("PAYJOIN", "min_fee_rate"))
     params["minfeerate"] = min_fee_rate
-
-    destination_url = manager.server.encode("utf-8")
-    url_parts = list(urlparse.urlparse(destination_url))
-    url_parts[4] = urlencode(params).encode("utf-8")
-    destination_url = urlparse.urlunparse(url_parts)
-    # TODO what to use as user agent?
-    d = agent.request(b"POST", destination_url,
-        Headers({"User-Agent": ["Twisted Web Client Example"],
-                "Content-Type": ["text/plain"]}),
-        bodyProducer=body)
-    d.addCallback(receive_payjoin_proposal_from_server, manager)
-    # note that the errback (here "noResponse") is *not* triggered
-    # by a server rejection (which is accompanied by a non-200
-    # status code returned), but by failure to communicate.
-    def noResponse(failure):
-        failure.trap(ResponseFailed, ConnectionRefusedError,
-                     HostUnreachableError, ConnectionLost)
-        log.error(failure.value)
-        fallback_nonpayjoin_broadcast(b"connection failed", manager)
-    d.addErrback(noResponse)
-    if return_deferred:
-        return d
+    success_callback = process_payjoin_proposal_from_server
+    failure_callback = process_error_from_server
+    factory = BIP78ClientProtocolFactory(manager, params,
+                                         success_callback, failure_callback)
+    # TODO add SSL option as for other protocol instances:
+    reactor.connectTCP(jm_single().config.get("DAEMON", "daemon_host"),
+                  jm_single().config.getint("DAEMON", "daemon_port")-2000,
+                  factory)
     return (True, None)
 
 def fallback_nonpayjoin_broadcast(err, manager):
@@ -665,19 +621,14 @@ def fallback_nonpayjoin_broadcast(err, manager):
         manager.timeout_fallback_dc.cancel()
     quit()
 
-def receive_payjoin_proposal_from_server(response, manager):
+def process_error_from_server(errormsg, errorcode, manager):
     assert isinstance(manager, JMPayjoinManager)
-    # no attempt at chunking or handling incrementally is needed
-    # here. The body should be a byte string containing the
-    # new PSBT, or a jsonified error page.
-    d = readBody(response)
-    # if the response code is not 200 OK, we must assume payjoin
-    # attempt has failed, and revert to standard payment.
-    if int(response.code) != 200:
-        log.warn("Receiver returned error code: " + str(response.code))
-        d.addCallback(fallback_nonpayjoin_broadcast, manager)
-        return
-    d.addCallback(process_payjoin_proposal_from_server, manager)
+    # payjoin attempt has failed, we revert to standard payment.
+    assert int(errorcode) != 200
+    log.warn("Receiver returned error code: {}, message: {}".format(
+        errorcode, errormsg))
+    d.addCallback(fallback_nonpayjoin_broadcast, manager)
+    return
 
 def process_payjoin_proposal_from_server(response_body, manager):
     assert isinstance(manager, JMPayjoinManager)
